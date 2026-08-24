@@ -15,3 +15,6 @@ npm/antigravity-oauth-proxy
 npm/antigravity-oauth-proxy.exe
 
 sh.d.antigravity-oauth-proxy.plist
+
+# Local linked worktrees
+.worktrees/
