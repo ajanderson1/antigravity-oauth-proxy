@@ -11,6 +11,10 @@ import (
 	"github.com/dvcrn/antigravity-oauth-proxy/internal/server"
 )
 
+func listenAddress(port string) string {
+	return "127.0.0.1:" + port
+}
+
 func main() {
 	port := env.GetOrDefault("PORT", "9878")
 
@@ -66,7 +70,7 @@ func main() {
 	srv := server.NewServer(provider, projectID)
 
 	// Start server
-	if err := srv.Start(":" + port); err != nil {
+	if err := srv.Start(listenAddress(port)); err != nil {
 		logger.Get().Fatal().Err(err).Msg("Failed to start server")
 	}
 }
