@@ -40,12 +40,21 @@ type NativeToolResponse struct {
 	Data interface{} `json:"data"`
 }
 
-// OpenAIToolCall represents a tool call in OpenAI format
+type GoogleToolMetadata struct {
+	ThoughtSignature string `json:"thought_signature,omitempty"`
+}
+
+type ToolExtraContent struct {
+	Google *GoogleToolMetadata `json:"google,omitempty"`
+}
+
+// OpenAIToolCall represents a tool call in OpenAI format.
 type OpenAIToolCall struct {
-	Index    int                `json:"index"`
-	ID       string             `json:"id"`
-	Type     string             `json:"type"`
-	Function OpenAIFunctionCall `json:"function"`
+	ExtraContent *ToolExtraContent  `json:"extra_content,omitempty"`
+	Index        int                `json:"index"`
+	ID           string             `json:"id"`
+	Type         string             `json:"type"`
+	Function     OpenAIFunctionCall `json:"function"`
 }
 
 // OpenAIFunctionCall represents the function part of a tool call
@@ -126,11 +135,12 @@ func CreateOpenAIStreamTransformer(model string) func(<-chan StreamChunk) <-chan
 			creationTime := time.Now().Unix()
 			firstChunk := true
 			var toolCallID *string
+			toolCallIndex := 0
 			var usageData *UsageData
 
 			// Process each chunk
 			for chunk := range input {
-				logger.Get().Info().Interface("chunk", chunk).Msg("Processing Gemini stream chunk")
+				logger.Get().Debug().Str("type", chunk.Type).Msg("Processing Gemini stream chunk")
 
 				delta := OpenAIDelta{}
 				shouldSend := false
@@ -165,7 +175,7 @@ func CreateOpenAIStreamTransformer(model string) func(<-chan StreamChunk) <-chan
 					if funcCall, ok := toGeminiFunctionCall(chunk.Data); ok {
 						callID := fmt.Sprintf("call_%s", uuid.New().String())
 						if funcCall.ThoughtSignature != "" {
-							logger.Get().Info().Str("signature", funcCall.ThoughtSignature).Msg("Extracted thought_signature from Gemini, appending to ID")
+							logger.Get().Debug().Msg("Preserving Gemini thought signature")
 							callID = callID + "|" + funcCall.ThoughtSignature
 						}
 						toolCallID = &callID
@@ -173,7 +183,7 @@ func CreateOpenAIStreamTransformer(model string) func(<-chan StreamChunk) <-chan
 						argsJSON, _ := json.Marshal(funcCall.Args)
 						delta.ToolCalls = []OpenAIToolCall{
 							{
-								Index: 0,
+								Index: toolCallIndex,
 								ID:    callID,
 								Type:  "function",
 								Function: OpenAIFunctionCall{
@@ -183,6 +193,7 @@ func CreateOpenAIStreamTransformer(model string) func(<-chan StreamChunk) <-chan
 							},
 						}
 
+						toolCallIndex++
 						if firstChunk {
 							role := "assistant"
 							delta.Role = &role
