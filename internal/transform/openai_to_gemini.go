@@ -21,6 +21,22 @@ func ToGeminiRequest(openAIReq *openai.ChatCompletionRequest, projectID string) 
 		return nil, fmt.Errorf("failed to convert messages: %w", err)
 	}
 
+	// Only the first parallel call needs a signature; unsigned siblings must stay bare.
+	// Use the compatibility sentinel only when that first call has no real signature.
+	if strings.HasPrefix(openAIReq.Model, "gemini-") {
+		for i := range geminiContents {
+			for j := range geminiContents[i].Parts {
+				part := &geminiContents[i].Parts[j]
+				if part.FunctionCall != nil {
+					if part.ThoughtSignature == "" {
+						part.ThoughtSignature = "skip_thought_signature_validator"
+					}
+					break
+				}
+			}
+		}
+	}
+
 	// Handle tools
 	geminiTools := convertToolsToGeminiTools(openAIReq.Tools)
 
@@ -144,7 +160,7 @@ func convertMessagesToGeminiContents(messages []openai.Message) (geminiContents 
 				}
 				logger.Get().Info().
 					Str("function", resolvedName).
-					Str("tool_call_id", msg.ToolCallID).
+					Int("tool_call_id_len", len(msg.ToolCallID)).
 					Int("response_len", len(content)).
 					Str("response_preview", preview).
 					Msg("Forwarding tool response to Gemini")
@@ -204,7 +220,7 @@ func convertMessagesToGeminiContents(messages []openai.Message) (geminiContents 
 				}
 				logger.Get().Info().
 					Str("function", resolvedName).
-					Str("tool_call_id", msg.ToolCallID).
+					Int("tool_call_id_len", len(msg.ToolCallID)).
 					Int("response_len", len(full)).
 					Str("response_preview", preview).
 					Msg("Forwarding tool response to Gemini")
@@ -255,8 +271,8 @@ func convertMessagesToGeminiContents(messages []openai.Message) (geminiContents 
 					id = id[:idx]
 				}
 
-				if thoughtSignature != "" {
-					logger.Get().Info().Str("signature", thoughtSignature).Msg("Restored thought_signature from client tool call ID")
+				if tc.ExtraContent != nil && tc.ExtraContent.Google != nil && tc.ExtraContent.Google.ThoughtSignature != "" {
+					thoughtSignature = tc.ExtraContent.Google.ThoughtSignature
 				}
 
 				if tc.Function.Name != "" {

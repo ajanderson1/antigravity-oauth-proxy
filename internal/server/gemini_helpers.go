@@ -9,6 +9,14 @@ import (
 	"github.com/dvcrn/antigravity-oauth-proxy/internal/logger"
 )
 
+func geminiPartSignature(part map[string]interface{}) string {
+	if signature, ok := part["thoughtSignature"].(string); ok && signature != "" {
+		return signature
+	}
+	signature, _ := part["thought_signature"].(string)
+	return signature
+}
+
 var geminiPathRegex = regexp.MustCompile(`v1(?:beta)?/models/([^/:]+):(.+)`)
 
 // parseGeminiPath extracts the model and action from a Gemini API path

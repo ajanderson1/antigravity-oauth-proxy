@@ -12,6 +12,7 @@ import (
 	"github.com/dvcrn/antigravity-oauth-proxy/internal/logger"
 	"github.com/dvcrn/antigravity-oauth-proxy/internal/openai"
 	"github.com/dvcrn/antigravity-oauth-proxy/internal/transform"
+	"github.com/google/uuid"
 )
 
 // openAIChatCompletionsHandler handles OpenAI-compatible chat completion requests.
@@ -88,7 +89,7 @@ func (s *Server) openAIChatCompletionsHandler(w http.ResponseWriter, r *http.Req
 
 		logger.Get().Info().
 			Int("index", i).
-			Str("tool_call_id", m.ToolCallID).
+			Int("tool_call_id_len", len(m.ToolCallID)).
 			Str("name", m.Name).
 			Str("content_kind", kind).
 			Int("content_len", len(preview)).
@@ -156,8 +157,8 @@ func (s *Server) chatCompletionRequestStream(w http.ResponseWriter, r *http.Requ
 		Msg("Starting upstream StreamGenerateContent")
 
 	if err := s.antigravityClient.StreamGenerateContent(r.Context(), gemReq, upstream); err != nil {
-		logger.Get().Error().Err(err).Msg("StreamGenerateContent call failed")
-		http.Error(w, "Upstream streaming error", http.StatusInternalServerError)
+		logger.Get().Error().Msg("StreamGenerateContent call failed")
+		writeChatUpstreamError(w, err)
 		return
 	}
 	logger.Get().Info().Msg("Upstream StreamGenerateContent started")
@@ -209,6 +210,9 @@ func (s *Server) chatCompletionRequestStream(w http.ResponseWriter, r *http.Requ
 		defer close(chunkIn)
 		firstUpstream := true
 		firstThoughtSeen := false
+		// Thought signatures may precede the first call in a separate SSE event.
+		var pendingSignature string
+		firstCall := true
 		for line := range upstream {
 			if firstUpstream {
 				cancelPinger() // Stop pinger on first data
@@ -283,12 +287,17 @@ func (s *Server) chatCompletionRequestStream(w http.ResponseWriter, r *http.Requ
 						}
 					}
 
-					// Process parts
 					for _, p := range parts {
 						part, ok := p.(map[string]interface{})
 						if !ok {
 							logger.Get().Warn().Interface("part", p).Msg("Skipping invalid part in Gemini stream")
 							continue
+						}
+
+						if firstCall && part["functionCall"] == nil {
+							if signature := geminiPartSignature(part); signature != "" {
+								pendingSignature = signature
+							}
 						}
 
 						// Thought tokens (reasoning) — map to OpenAI reasoning stream
@@ -377,12 +386,11 @@ func (s *Server) chatCompletionRequestStream(w http.ResponseWriter, r *http.Requ
 								Int("arg_keys", len(args)).
 								Msg("Emitting tool call from model")
 
-							var thoughtSignature string
-							if ts, ok := part["thoughtSignature"].(string); ok {
-								thoughtSignature = ts
-							} else if ts, ok := part["thought_signature"].(string); ok {
-								thoughtSignature = ts
+							thoughtSignature := geminiPartSignature(part)
+							if thoughtSignature == "" && firstCall {
+								thoughtSignature = pendingSignature
 							}
+							firstCall = false
 
 							// Emit tool call to OpenAI transformer
 							chunkIn <- openai.StreamChunk{
@@ -447,61 +455,12 @@ func (s *Server) chatCompletionRequest(w http.ResponseWriter, r *http.Request, r
 	apiStart := time.Now()
 	resp, err := s.antigravityClient.GenerateContent(gemReq)
 	if err != nil {
-		logger.Get().Error().Err(err).Dur("api_call_duration", time.Since(apiStart)).Msg("GenerateContent failed")
-		http.Error(w, "Error calling GenerateContent", http.StatusInternalServerError)
+		logger.Get().Error().Dur("api_call_duration", time.Since(apiStart)).Msg("GenerateContent failed")
+		writeChatUpstreamError(w, err)
 		return
 	}
 
-	// Extract assistant text content from first candidate
-	var contentText string
-	var reasoningText string
-	if resp != nil && resp.Response != nil {
-		if cands, ok := resp.Response["candidates"].([]interface{}); ok && len(cands) > 0 {
-			if first, ok := cands[0].(map[string]interface{}); ok {
-				// parts may be under content.parts or parts
-				var parts []interface{}
-				if c, ok := first["content"].(map[string]interface{}); ok {
-					if ps, ok := c["parts"].([]interface{}); ok {
-						parts = ps
-					}
-				}
-				if len(parts) == 0 {
-					if ps, ok := first["parts"].([]interface{}); ok {
-						parts = ps
-					}
-				}
-				var bText strings.Builder
-				var bReasoning strings.Builder
-				for _, p := range parts {
-					if pm, ok := p.(map[string]interface{}); ok {
-						if txt, ok := pm["text"].(string); ok && txt != "" {
-							if isThought, ok := pm["thought"].(bool); ok && isThought {
-								if bReasoning.Len() > 0 {
-									bReasoning.WriteString("\n")
-								}
-								bReasoning.WriteString(txt)
-							} else {
-								if bText.Len() > 0 {
-									bText.WriteString("\n")
-								}
-								bText.WriteString(txt)
-							}
-						}
-					}
-				}
-				contentText = bText.String()
-				reasoningText = bReasoning.String()
-			}
-		}
-	}
-
-	message := map[string]interface{}{
-		"role":    "assistant",
-		"content": contentText,
-	}
-	if reasoningText != "" {
-		message["reasoning_content"] = reasoningText
-	}
+	message, finishReason := nonStreamingAssistantMessage(resp)
 
 	// Build OpenAI-style response
 	created := time.Now().Unix()
@@ -514,7 +473,7 @@ func (s *Server) chatCompletionRequest(w http.ResponseWriter, r *http.Request, r
 			{
 				"index":         0,
 				"message":       message,
-				"finish_reason": "stop",
+				"finish_reason": finishReason,
 			},
 		},
 	}
@@ -550,4 +509,90 @@ func (s *Server) chatCompletionRequest(w http.ResponseWriter, r *http.Request, r
 		Dur("api_call_duration", time.Since(apiStart)).
 		Dur("total_duration", time.Since(startTime)).
 		Msg("OpenAI non-streaming response completed")
+}
+
+func nonStreamingAssistantMessage(resp *antigravity.GenerateContentResponse) (map[string]interface{}, string) {
+	message := map[string]interface{}{"role": "assistant", "content": ""}
+	if resp == nil || resp.Response == nil {
+		return message, "stop"
+	}
+	candidates, ok := resp.Response["candidates"].([]interface{})
+	if !ok || len(candidates) == 0 {
+		return message, "stop"
+	}
+	candidate, ok := candidates[0].(map[string]interface{})
+	if !ok {
+		return message, "stop"
+	}
+
+	var parts []interface{}
+	if content, ok := candidate["content"].(map[string]interface{}); ok {
+		parts, _ = content["parts"].([]interface{})
+	}
+	if len(parts) == 0 {
+		parts, _ = candidate["parts"].([]interface{})
+	}
+
+	var text, reasoning strings.Builder
+	var toolCalls []openai.OpenAIToolCall
+	var pendingSignature string
+	for _, raw := range parts {
+		part, ok := raw.(map[string]interface{})
+		if !ok {
+			continue
+		}
+		if len(toolCalls) == 0 && part["functionCall"] == nil {
+			if signature := geminiPartSignature(part); signature != "" {
+				pendingSignature = signature
+			}
+		}
+		if value, ok := part["text"].(string); ok && value != "" {
+			builder := &text
+			if part["thought"] == true {
+				builder = &reasoning
+			}
+			if builder.Len() > 0 {
+				builder.WriteByte('\n')
+			}
+			builder.WriteString(value)
+		}
+		call, ok := part["functionCall"].(map[string]interface{})
+		if !ok {
+			continue
+		}
+		name, _ := call["name"].(string)
+		if name == "" {
+			continue
+		}
+		args, err := json.Marshal(call["args"])
+		if err != nil || string(args) == "null" {
+			args = []byte("{}")
+		}
+		id := "call_" + uuid.NewString()
+		signature := geminiPartSignature(part)
+		if signature == "" && len(toolCalls) == 0 {
+			signature = pendingSignature
+		}
+		if signature != "" {
+			id += "|" + signature
+		}
+		toolCalls = append(toolCalls, openai.OpenAIToolCall{
+			Index: len(toolCalls), ID: id, Type: "function",
+			Function: openai.OpenAIFunctionCall{Name: name, Arguments: string(args)},
+		})
+	}
+
+	if text.Len() > 0 || len(toolCalls) == 0 {
+		message["content"] = text.String()
+	} else {
+		message["content"] = nil
+	}
+	if reasoning.Len() > 0 {
+		message["reasoning_content"] = reasoning.String()
+	}
+	if len(toolCalls) > 0 {
+		message["tool_calls"] = toolCalls
+		return message, "tool_calls"
+	}
+	return message, "stop"
 }
